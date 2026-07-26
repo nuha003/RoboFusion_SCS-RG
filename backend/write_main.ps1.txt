@@ -1,0 +1,617 @@
+@'
+"""
+SCS-RG Backend — FastAPI application. (CORRECTED v3)
+
+Covers (see Round 1 case document, Section 07 & 08, plus Section 09 Test Case 18b):
+  - Test Case 6: Real-time ingestion & risk fusion (server-side computation,
+    input validation, duplicate handling)
+  - Test Case 7: Alert broadcast & conflict handling (race-condition-safe ack)
+  - Test Case 8: API design (zone status, incident history, ack, admin override)
+  - Test Case 9: Backend resilience (state reconstructed from DB on startup)
+  - Test Case 10: Security & authentication (per-zone API key, session token)
+  - Test Case 18b: Concurrency & integrity -- deleting/archiving a zone with
+    open incidents is blocked (new in this version)
+
+CHANGES IN THIS VERSION (on top of the previous corrected version):
+  7. NEW: added DELETE /api/zones/{zone_id} -- admin-only, soft-archives a
+     zone via the existing Zone.is_archived flag rather than a real SQL
+     DELETE, so historical Reading/Incident rows keep valid referential
+     integrity (Test Case 18b). Blocked with 409 if the zone still has any
+     non-RESOLVED incident. Also clears the zone out of the in-memory
+     zone_state dict so it stops appearing in /api/zones/status and the
+     priority queue once archived.
+
+Still relies on (from previous fixes, see backend_fixes.md):
+  1. SensorPayload accepts gas_warming_up (informational/logged only -- the
+     backend still computes its own warm-up window server-side) and
+     pir_offline (trusted from the node -- the backend has no independent
+     way to know a PIR sensor died).
+  2. classify_state() is OFFLINE-aware (now fixed in risk_engine.py to
+     actually accept the sensor_offline kwarg). OFFLINE never opens an
+     incident and never actuates.
+  3. seen_sequences uses collections.deque(maxlen=200), which evicts the
+     OLDEST entries first (not a random subset like a plain set() would).
+  4. Blocking synchronous DB calls (db.query, db.commit) are wrapped in
+     run_in_threadpool so they never block the single asyncio event loop
+     thread -- matters for Test Case 6e and Test Case 11.
+  5. Admin override 404s if the zone_id isn't actually registered, instead
+     of silently creating phantom state for a typo'd zone.
+  6. _process_reading_sync() fetches the Zone row directly instead of
+     re-running verify_zone_key() with a null API key -- auth only happens
+     once per request, in ingest_reading().
+
+Run with:  uvicorn main:app --reload --port 8000
+
+NOTE: this file assumes models.py has a
+  pir_offline = Column(Boolean, default=False)
+column on Reading, and risk_engine.py's classify_state() accepts a
+sensor_offline kwarg -- both are fixed in the corrected versions of those
+two files.
+"""
+
+from collections import deque
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+
+from database import init_db, get_db, SessionLocal
+from models import Zone, Reading, Incident, Acknowledgment, User
+from risk_engine import (
+    compute_risk_score, classify_state, dominant_hazard, rank_critical_zones,
+    GAS_CRITICAL_RAW, WATER_CRITICAL_RAW,
+)
+
+app = FastAPI(title="SCS-RG Backend")
+
+# Allow the frontend dev server (different port = different origin) to call
+# this API. In a real deployment, restrict allow_origins to your actual
+# dashboard domain instead of "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# In-memory state (per-zone). Rebuilt from DB on startup so the backend can
+# be restarted without losing track of current zone states (Test Case 9a).
+# ---------------------------------------------------------------------------
+zone_state = {}        # zone_id (str) -> {"state": str, "risk_score": float, "since": datetime}
+seen_sequences = {}     # zone_id (str) -> deque[int] of recent sequence numbers (dedup, Test Case 6d)
+fire_debounce = {}      # zone_id (str) -> consecutive HIGH flame reading count
+zone_first_seen = {}    # zone_id (str) -> datetime of first reading (for gas sensor warm-up)
+
+DEBOUNCE_COUNT_REQUIRED = 5    # ~1 second at 200ms sampling (Test Case 1)
+WARMUP_SECONDS = 30            # ignore gas readings during warm-up (Test Case 2d)
+SEQUENCE_HISTORY_SIZE = 200    # how many recent sequence numbers we remember per zone
+
+connected_dashboards: List[WebSocket] = []
+
+
+@app.on_event("startup")
+def on_startup():
+    """Rebuild zone state from the database instead of assuming everything
+    is SAFE (Test Case 9a, Test Case 23e)."""
+    init_db()
+    db = SessionLocal()
+    try:
+        zones = db.query(Zone).filter(Zone.is_archived == False).all()
+        for z in zones:
+            last_reading = (
+                db.query(Reading)
+                .filter(Reading.zone_id == z.id)
+                .order_by(Reading.timestamp.desc())
+                .first()
+            )
+            if last_reading:
+                zone_state[z.zone_id] = {
+                    "state": last_reading.state,
+                    "risk_score": last_reading.risk_score,
+                    "since": last_reading.timestamp,
+                }
+            else:
+                zone_state[z.zone_id] = {"state": "SAFE", "risk_score": 0, "since": datetime.utcnow()}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+class SensorPayload(BaseModel):
+    fire: float = Field(..., ge=0, le=1)            # 0 or 1
+    gas: float = Field(..., ge=0, le=1)              # normalized 0.0-1.0
+    gas_warming_up: bool = False                     # node's own warm-up flag -- informational/logged
+                                                        # only; the backend computes its own warm-up
+                                                        # window below and never trusts this blindly
+    water: float = Field(..., ge=0, le=1)            # normalized 0.0-1.0
+    occupancy: bool
+    pir_offline: bool = False                         # trusted from the node -- the backend has no
+                                                        # independent way to know a PIR sensor died
+    sequence_no: int
+
+
+class AckRequest(BaseModel):
+    user_id: int
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers (Test Case 10)
+# ---------------------------------------------------------------------------
+def verify_zone_key(zone_id: str, x_api_key: Optional[str], db: Session) -> Zone:
+    zone = db.query(Zone).filter(Zone.zone_id == zone_id, Zone.is_archived == False).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not registered")
+    if not x_api_key or x_api_key != zone.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing zone API key")
+    return zone
+
+
+def verify_user(x_auth_token: Optional[str], db: Session) -> User:
+    if not x_auth_token:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+    user = db.query(User).filter(User.token == x_auth_token).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid session token")
+    return user
+
+
+def require_admin(user: User):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+
+
+# ---------------------------------------------------------------------------
+# WebSocket broadcast (Test Case 12a, Test Case 7a)
+# ---------------------------------------------------------------------------
+async def broadcast_zone_update(payload: dict):
+    dead = []
+    for ws in connected_dashboards:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        connected_dashboards.remove(ws)
+
+
+@app.websocket("/ws/dashboard")
+async def dashboard_ws(websocket: WebSocket):
+    await websocket.accept()
+    connected_dashboards.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep-alive; dashboard doesn't need to send anything
+    except WebSocketDisconnect:
+        connected_dashboards.remove(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper: does the blocking DB work for one ingested reading.
+# Wrapped with run_in_threadpool from the endpoint below so it never blocks
+# the asyncio event loop (fixes Test Case 6e / Test Case 11 concurrency).
+#
+# FIX: this function used to call verify_zone_key(zone_id, None, db) here,
+# which re-ran the auth check with a NULL api key and therefore raised 401
+# on every reading -- even ones whose real API key had already been
+# validated correctly by ingest_reading() before this function was ever
+# called. Auth only needs to happen once per request, so this now just
+# fetches the Zone row directly (mirroring what verify_zone_key does
+# internally, minus the redundant/broken key check).
+# ---------------------------------------------------------------------------
+def _process_reading_sync(zone_id: str, payload: SensorPayload, db: Session):
+    zone = db.query(Zone).filter(Zone.zone_id == zone_id, Zone.is_archived == False).first()
+    if not zone:
+        # Should be unreachable in practice -- ingest_reading() already
+        # verified the zone exists via verify_zone_key() before calling
+        # this function. Kept as a defensive guard in case of a race where
+        # the zone gets archived between the two checks.
+        raise HTTPException(status_code=404, detail="Zone not registered")
+
+    # --- duplicate handling (Test Case 6d): ordered, bounded history so the
+    # OLDEST entries get evicted first, not a random subset (fixed vs. the
+    # previous set()-based version) ---
+    seen = seen_sequences.setdefault(zone_id, deque(maxlen=SEQUENCE_HISTORY_SIZE))
+    if payload.sequence_no in seen:
+        return {"status": "duplicate_ignored", "sequence_no": payload.sequence_no}
+    seen.append(payload.sequence_no)
+
+    # --- fire debounce (Test Case 1b/1c): require N consecutive HIGH readings ---
+    if payload.fire >= 1:
+        fire_debounce[zone_id] = fire_debounce.get(zone_id, 0) + 1
+    else:
+        fire_debounce[zone_id] = 0
+    fire_confirmed = 1.0 if fire_debounce[zone_id] >= DEBOUNCE_COUNT_REQUIRED else 0.0
+
+    # --- gas sensor warm-up (Test Case 2d): server-side authority, not the
+    # node's self-reported gas_warming_up flag ---
+    first_seen = zone_first_seen.setdefault(zone_id, datetime.utcnow())
+    gas_value = payload.gas
+    server_side_warmup = (datetime.utcnow() - first_seen).total_seconds() < WARMUP_SECONDS
+    if server_side_warmup:
+        gas_value = 0.0
+
+    occupancy_factor = 1.0 if payload.occupancy else 0.0
+
+    # --- server-side risk computation (Test Case 6a) -- client value is NEVER trusted ---
+    score = compute_risk_score(fire_confirmed, gas_value, payload.water, occupancy_factor)
+
+    # --- OFFLINE takes priority over the computed score: a dead sensor is a
+    # fault, not a confirmed hazard (Test Case 4d, Test Case 23a). Fire,
+    # gas, or water each force CRITICAL on their own when their raw reading
+    # crosses its own dangerous threshold, even if that single hazard's
+    # weight alone wouldn't cross the composite 65-point threshold
+    # (Test Case 1c/2c/3c/5a -- see risk_engine.py's "SECOND FIX"/"THIRD
+    # FIX") ---
+    new_state = classify_state(
+        score,
+        sensor_offline=payload.pir_offline,
+        fire_confirmed=(fire_confirmed >= 1.0),
+        gas_critical=(gas_value >= GAS_CRITICAL_RAW),
+        water_critical=(payload.water >= WATER_CRITICAL_RAW),
+    )
+    hazard = dominant_hazard(fire_confirmed, gas_value, payload.water, occupancy_factor)
+
+    reading = Reading(
+        zone_id=zone.id,
+        fire_raw=payload.fire,
+        gas_raw=payload.gas,
+        water_raw=payload.water,
+        occupancy_raw=payload.occupancy,
+        pir_offline=payload.pir_offline,
+        risk_score=score,
+        state=new_state,
+        sequence_no=payload.sequence_no,
+    )
+    db.add(reading)
+    db.commit()
+
+    old_state = zone_state.get(zone_id, {}).get("state", "SAFE")
+    state_changed = old_state != new_state
+
+    broadcast_payload = None
+
+    if state_changed:
+        zone_state[zone_id] = {"state": new_state, "risk_score": score, "since": datetime.utcnow()}
+
+        # Only open an incident for a real hazard state -- OFFLINE is a
+        # sensor fault, not a confirmed hazard, so it doesn't enter the
+        # incident/priority-ranking flow the same way WARNING/CRITICAL do.
+        if new_state in ("WARNING", "CRITICAL"):
+            incident = Incident(
+                zone_id=zone.id,
+                state=new_state,
+                risk_score_at_trigger=score,
+                hazard_type=hazard,
+                status="OPEN",
+            )
+            db.add(incident)
+            db.commit()
+
+        # close any open incident if recovering to SAFE (Test Case 1d, Test Case 5c)
+        if new_state == "SAFE":
+            open_incident = (
+                db.query(Incident)
+                .filter(Incident.zone_id == zone.id, Incident.status != "RESOLVED")
+                .order_by(Incident.created_at.desc())
+                .first()
+            )
+            if open_incident:
+                open_incident.status = "RESOLVED"
+                open_incident.resolved_at = datetime.utcnow()
+                db.commit()
+
+        broadcast_payload = {
+            "type": "zone_update",
+            "zone_id": zone_id,
+            "state": new_state,
+            "risk_score": score,
+            "hazard_type": hazard,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    return {
+        "zone_id": zone_id,
+        "risk_score": score,
+        "state": new_state,
+        # OFFLINE must never actuate -- a dead sensor is not a confirmed hazard
+        "actuate": new_state == "CRITICAL",
+        "_broadcast_payload": broadcast_payload,  # consumed by the endpoint, not sent to the caller
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test Case 6: Ingestion endpoint
+# ---------------------------------------------------------------------------
+@app.post("/api/ingest/{zone_id}")
+async def ingest_reading(
+    zone_id: str,
+    payload: SensorPayload,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    # auth check happens exactly ONCE, here -- also run off the event loop
+    # since it's a DB call
+    await run_in_threadpool(verify_zone_key, zone_id, x_api_key, db)
+
+    # all the blocking DB work happens in the threadpool, not on the event
+    # loop thread (fixes Test Case 6e concurrent ingestion / Test Case 11
+    # scalability -- previously every request serialized on this thread)
+    result = await run_in_threadpool(_process_reading_sync, zone_id, payload, db)
+
+    broadcast_payload = result.pop("_broadcast_payload", None)
+    if broadcast_payload:
+        await broadcast_zone_update(broadcast_payload)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Test Case 8: API design
+# ---------------------------------------------------------------------------
+@app.get("/api/zones/status")
+async def get_all_zone_status(x_auth_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Returns current state of ALL zones in a single call (Test Case 8a)."""
+    await run_in_threadpool(verify_user, x_auth_token, db)
+
+    def _query():
+        zones = db.query(Zone).filter(Zone.is_archived == False).all()
+        result = []
+        for z in zones:
+            st = zone_state.get(z.zone_id, {"state": "SAFE", "risk_score": 0, "since": datetime.utcnow()})
+            result.append({
+                "zone_id": z.zone_id,
+                "name": z.name,
+                "state": st["state"],
+                "risk_score": st["risk_score"],
+            })
+        return result
+
+    zones_result = await run_in_threadpool(_query)
+    return {"zones": zones_result}
+
+
+@app.get("/api/zones/priority-queue")
+async def get_priority_queue(x_auth_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """Ranked list of currently-CRITICAL zones (Test Case 12b/12c)."""
+    await run_in_threadpool(verify_user, x_auth_token, db)
+
+    def _build():
+        critical_zones = []
+        for zone_id, st in zone_state.items():
+            if st["state"] == "CRITICAL":
+                zone = db.query(Zone).filter(Zone.zone_id == zone_id).first()
+                last_reading = (
+                    db.query(Reading).filter(Reading.zone_id == zone.id)
+                    .order_by(Reading.timestamp.desc()).first()
+                )
+                open_incident = (
+                    db.query(Incident)
+                    .filter(Incident.zone_id == zone.id, Incident.status != "RESOLVED")
+                    .order_by(Incident.created_at.desc())
+                    .first()
+                )
+                critical_zones.append({
+                    "zone_id": zone_id,
+                    "incident_id": open_incident.id if open_incident else None,
+                    "incident_status": open_incident.status if open_incident else None,
+                    "risk_score": st["risk_score"],
+                    "occupancy": 1 if (last_reading and last_reading.occupancy_raw) else 0,
+                    "time_critical": (datetime.utcnow() - st["since"]).total_seconds(),
+                })
+        ranked = rank_critical_zones(critical_zones)
+        for i, z in enumerate(ranked):
+            z["reason"] = (
+                f"Ranked #{i+1}: risk_score={z['risk_score']}, "
+                f"occupied={'yes' if z['occupancy'] else 'no'}, "
+                f"critical_for={int(z['time_critical'])}s"
+            )
+        return ranked
+
+    ranked = await run_in_threadpool(_build)
+    return {"priority_queue": ranked}
+
+
+@app.get("/api/incidents")
+async def get_incident_history(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    x_auth_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Historical incidents, filterable by date range (Test Case 8b)."""
+    await run_in_threadpool(verify_user, x_auth_token, db)
+
+    def _query():
+        query = db.query(Incident)
+        if start_date:
+            query = query.filter(Incident.created_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            query = query.filter(Incident.created_at <= datetime.fromisoformat(end_date))
+        incidents = query.order_by(Incident.created_at.desc()).all()
+
+        result = []
+        for inc in incidents:
+            zone = db.query(Zone).filter(Zone.id == inc.zone_id).first()
+            ack = db.query(Acknowledgment).filter(Acknowledgment.incident_id == inc.id).first()
+            result.append({
+                "id": inc.id,
+                "zone": zone.name if zone else "unknown",
+                "hazard_type": inc.hazard_type,
+                "state": inc.state,
+                "status": inc.status,
+                "created_at": inc.created_at.isoformat(),
+                "resolved_at": inc.resolved_at.isoformat() if inc.resolved_at else None,
+                "acknowledged_by": ack.user_id if ack else None,
+                "acknowledged_at": ack.acknowledged_at.isoformat() if ack else None,
+            })
+        return result
+
+    result = await run_in_threadpool(_query)
+    return {"incidents": result}
+
+
+@app.post("/api/incidents/{incident_id}/ack")
+async def acknowledge_incident(
+    incident_id: int,
+    body: AckRequest,
+    x_auth_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Acknowledge an alert. Race-condition-safe: only ONE ack is ever recorded,
+    even if two staff members click at nearly the same moment (Test Case 7b)."""
+    await run_in_threadpool(verify_user, x_auth_token, db)
+
+    def _ack():
+        incident = db.query(Incident).filter(Incident.id == incident_id).first()
+        if not incident:
+            return None  # signals 404 to the caller below
+
+        existing_ack = db.query(Acknowledgment).filter(Acknowledgment.incident_id == incident_id).first()
+        if existing_ack:
+            # "first write wins" -- someone already acknowledged it, don't create a second record
+            return {"status": "already_acknowledged", "acknowledged_by": existing_ack.user_id}
+
+        ack = Acknowledgment(incident_id=incident_id, user_id=body.user_id)
+        db.add(ack)
+        incident.status = "ACKNOWLEDGED"
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            # unique constraint on incident_id caught a concurrent duplicate insert
+            existing_ack = db.query(Acknowledgment).filter(Acknowledgment.incident_id == incident_id).first()
+            return {"status": "already_acknowledged", "acknowledged_by": existing_ack.user_id}
+
+        return {"status": "acknowledged", "acknowledged_by": body.user_id}
+
+    result = await run_in_threadpool(_ack)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Incident not found")  # Test Case 8c
+    return result
+
+
+@app.post("/api/admin/override/{zone_id}")
+async def admin_manual_override(
+    zone_id: str,
+    new_state: str,
+    x_auth_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Admin-only manual override (Test Case 13). Role is checked on the
+    BACKEND, not just hidden in the frontend UI.
+
+    Call as: POST /api/admin/override/{zone_id}?new_state=CRITICAL
+    (new_state is a query parameter, not a JSON body field.)
+    """
+    user = await run_in_threadpool(verify_user, x_auth_token, db)
+    require_admin(user)
+
+    if new_state not in ("SAFE", "WARNING", "CRITICAL"):
+        raise HTTPException(status_code=400, detail="Invalid state")
+
+    def _check_zone():
+        return db.query(Zone).filter(Zone.zone_id == zone_id, Zone.is_archived == False).first()
+
+    zone = await run_in_threadpool(_check_zone)
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not registered")  # fixes silent phantom-zone bug
+
+    zone_state[zone_id] = {
+        "state": new_state,
+        "risk_score": zone_state.get(zone_id, {}).get("risk_score", 0),
+        "since": datetime.utcnow(),
+    }
+    return {"status": "override_applied", "zone_id": zone_id, "new_state": new_state}
+
+
+# ---------------------------------------------------------------------------
+# Test Case 18b: Concurrency & Integrity -- zone archive (soft-delete)
+# ---------------------------------------------------------------------------
+@app.delete("/api/zones/{zone_id}")
+async def archive_zone(
+    zone_id: str,
+    x_auth_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Admin-only. Soft-archives a zone (Test Case 18b) -- never a real
+    SQL DELETE, so existing Reading/Incident rows keep valid referential
+    integrity and the incident timeline (Test Case 14) stays intact after
+    a zone is decommissioned.
+
+    Blocked with 409 if the zone still has any open (non-RESOLVED)
+    incident -- the caller must resolve or acknowledge those first.
+    """
+    user = await run_in_threadpool(verify_user, x_auth_token, db)
+    require_admin(user)
+
+    def _archive():
+        zone = db.query(Zone).filter(Zone.zone_id == zone_id, Zone.is_archived == False).first()
+        if not zone:
+            return {"error": "not_found"}
+
+        open_incidents = (
+            db.query(Incident)
+            .filter(Incident.zone_id == zone.id, Incident.status != "RESOLVED")
+            .count()
+        )
+        if open_incidents > 0:
+            return {"error": "has_open_incidents", "count": open_incidents}
+
+        zone.is_archived = True
+        db.commit()
+        return {"status": "archived", "zone_id": zone_id}
+
+    result = await run_in_threadpool(_archive)
+
+    if result.get("error") == "not_found":
+        raise HTTPException(status_code=404, detail="Zone not registered")
+    if result.get("error") == "has_open_incidents":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot archive zone '{zone_id}': {result['count']} open incident(s) exist. "
+                   f"Resolve or acknowledge them first.",
+        )
+
+    # remove from live in-memory state so it stops appearing in
+    # /api/zones/status and the priority queue once archived
+    zone_state.pop(zone_id, None)
+    return result
+
+
+@app.get("/api/zones/registered")
+async def list_registered_zones(x_auth_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    await run_in_threadpool(verify_user, x_auth_token, db)
+
+    def _query():
+        zones = db.query(Zone).filter(Zone.is_archived == False).all()
+        return [{"zone_id": z.zone_id, "name": z.name} for z in zones]
+
+    zones_result = await run_in_threadpool(_query)
+    return {"zones": zones_result}
+
+
+@app.get("/api/me")
+async def get_current_user(x_auth_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    """
+    Returns the identity of whoever holds this auth token: id, username, role.
+
+    WHY THIS EXISTS: the frontend dashboard needs to know the logged-in
+    user's role to decide whether to show admin-only UI (manual override
+    panel) -- this is the "interface-level restriction" half of Test Case
+    13a. It is NOT itself the security boundary: every admin-only endpoint
+    (e.g. /api/admin/override, DELETE /api/zones/{zone_id}) independently
+    calls require_admin() on the backend regardless of what the frontend
+    shows or hides, which is what makes Test Case 13b (a staff-role user
+    bypassing the UI with a direct API call) still correctly return 403.
+    """
+    user = await run_in_threadpool(verify_user, x_auth_token, db)
+    return {"id": user.id, "username": user.username, "role": user.role}
+'@ | Set-Content -Path main.py -Encoding UTF8
