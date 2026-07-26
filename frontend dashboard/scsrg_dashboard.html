@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SCS-RG — Campus Safety &amp; Response Grid</title>
+<style>
+  :root{
+    --bg:#0A0D12;
+    --bg-grid-line: rgba(58,160,255,0.055);
+    --panel:#12161D;
+    --panel-2:#171C24;
+    --border:#232A35;
+    --border-soft:#1A2029;
+    --text:#E8ECF1;
+    --text-dim:#8994A3;
+    --text-faint:#5B6472;
+
+    --safe:#34D399;
+    --safe-dim:rgba(52,211,153,0.14);
+    --warning:#F5A524;
+    --warning-dim:rgba(245,165,36,0.14);
+    --critical:#F4462F;
+    --critical-dim:rgba(244,70,47,0.16);
+    --offline:#6B7280;
+    --offline-dim:rgba(107,114,128,0.14);
+
+    --accent:#3AA0FF;
+    --accent-dim:rgba(58,160,255,0.14);
+
+    --font-ui: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      linear-gradient(var(--bg-grid-line) 1px, transparent 1px) 0 0/40px 40px,
+      linear-gradient(90deg, var(--bg-grid-line) 1px, transparent 1px) 0 0/40px 40px,
+      var(--bg);
+    color:var(--text);
+    font-family:var(--font-ui);
+    min-height:100vh;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{ background:var(--accent-dim); }
+  button{ font-family:inherit; cursor:pointer; }
+  input, select{ font-family:inherit; }
+  a{ color:var(--accent); }
+  :focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+  /* ================= LOGIN SCREEN ================= */
+  #loginScreen{
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    padding:24px;
+  }
+  .login-card{
+    width:100%; max-width:420px; background:var(--panel);
+    border:1px solid var(--border); border-radius:10px; padding:32px;
+  }
+  .login-mark{ display:flex; align-items:center; gap:10px; margin-bottom:4px; }
+  .login-mark .dot{ width:10px; height:10px; border-radius:50%; background:var(--accent); box-shadow:0 0 12px var(--accent); }
+  .login-mark span{ font-family:var(--font-mono); font-size:13px; letter-spacing:0.14em; color:var(--text-dim); text-transform:uppercase; }
+  .login-card h1{ font-size:22px; margin:10px 0 4px; letter-spacing:-0.01em; }
+  .login-card p.sub{ color:var(--text-dim); font-size:13.5px; margin:0 0 24px; line-height:1.5; }
+  .field{ margin-bottom:16px; }
+  .field label{ display:block; font-size:12px; color:var(--text-dim); margin-bottom:6px; letter-spacing:0.03em; }
+  .field input{
+    width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text);
+    padding:10px 12px; border-radius:7px; font-size:13.5px; font-family:var(--font-mono);
+  }
+  .field input::placeholder{ color:var(--text-faint); }
+  .btn-primary{
+    width:100%; background:var(--accent); color:#04101F; border:none; border-radius:7px;
+    padding:11px 14px; font-weight:600; font-size:14px; margin-top:4px;
+  }
+  .btn-primary:hover{ filter:brightness(1.08); }
+  .btn-primary:disabled{ opacity:0.5; cursor:not-allowed; }
+  .login-error{ color:var(--critical); font-size:12.5px; margin-top:12px; display:none; }
+  .login-hint{ margin-top:20px; padding-top:16px; border-top:1px solid var(--border-soft); font-size:11.5px; color:var(--text-faint); line-height:1.6; }
+  .login-hint code{ color:var(--text-dim); font-family:var(--font-mono); }
+
+  /* ================= APP SHELL ================= */
+  #app{ display:none; min-height:100vh; }
+  header.topbar{
+    position:sticky; top:0; z-index:40;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:12px 22px; background:rgba(10,13,18,0.88); backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{ display:flex; align-items:center; gap:10px; }
+  .brand-icon{ width:26px; height:26px; }
+  .brand-text .name{ font-weight:700; font-size:15px; letter-spacing:-0.01em; }
+  .brand-text .tag{ font-size:10.5px; color:var(--text-faint); letter-spacing:0.08em; text-transform:uppercase; }
+  .top-right{ display:flex; align-items:center; gap:16px; }
+  .conn-status{ display:flex; align-items:center; gap:7px; font-size:11.5px; color:var(--text-dim); font-family:var(--font-mono); }
+  .conn-dot{ width:8px; height:8px; border-radius:50%; background:var(--safe); }
+  .conn-dot.bad{ background:var(--critical); }
+  .conn-dot.warn{ background:var(--warning); animation:pulseDot 1.1s infinite; }
+  @keyframes pulseDot{ 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+  .role-badge{
+    font-size:10.5px; padding:4px 9px; border-radius:5px; font-weight:700; letter-spacing:0.05em;
+    text-transform:uppercase; font-family:var(--font-mono);
+  }
+  .role-badge.admin{ background:var(--accent-dim); color:var(--accent); }
+  .role-badge.security_staff{ background:var(--border); color:var(--text-dim); }
+  .userline{ font-size:13px; color:var(--text-dim); }
+  .userline b{ color:var(--text); }
+  .btn-ghost{
+    background:transparent; border:1px solid var(--border); color:var(--text-dim);
+    padding:6px 11px; border-radius:6px; font-size:12px;
+  }
+  .btn-ghost:hover{ border-color:var(--text-faint); color:var(--text); }
+
+  main{ max-width:1400px; margin:0 auto; padding:20px 22px 60px; }
+
+  /* ================= MOST URGENT BANNER ================= */
+  .urgent-banner{
+    position:relative; overflow:hidden; border-radius:10px; margin-bottom:22px;
+    border:1px solid var(--border); background:var(--panel);
+    display:flex; align-items:center; gap:16px; padding:16px 20px;
+  }
+  .urgent-banner .stripe{ position:absolute; left:0; top:0; bottom:0; width:6px; }
+  .urgent-banner.state-safe .stripe{ background:var(--safe); }
+  .urgent-banner.state-warning .stripe{ background:var(--warning); }
+  .urgent-banner.state-critical .stripe{ background:var(--critical); animation:stripePulse 1s infinite; }
+  @keyframes stripePulse{ 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+  .urgent-icon{ width:38px; height:38px; flex:none; margin-left:6px; }
+  .urgent-body{ flex:1; min-width:0; }
+  .urgent-eyebrow{ font-family:var(--font-mono); font-size:10.5px; letter-spacing:0.14em; text-transform:uppercase; color:var(--text-faint); margin-bottom:3px; }
+  .urgent-title{ font-size:19px; font-weight:700; letter-spacing:-0.01em; }
+  .urgent-title .zonename{ }
+  .urgent-reason{ font-size:12.5px; color:var(--text-dim); margin-top:3px; font-family:var(--font-mono); }
+  .urgent-score{ text-align:right; flex:none; }
+  .urgent-score .num{ font-family:var(--font-mono); font-size:30px; font-weight:700; line-height:1; }
+  .urgent-score .lbl{ font-size:10px; color:var(--text-faint); letter-spacing:0.1em; text-transform:uppercase; margin-top:2px; }
+  .state-safe .urgent-score .num{ color:var(--safe); }
+  .state-warning .urgent-score .num{ color:var(--warning); }
+  .state-critical .urgent-score .num{ color:var(--critical); }
+
+  /* ================= LAYOUT ================= */
+  .grid-layout{ display:grid; grid-template-columns: 1.55fr 1fr; gap:20px; align-items:start; }
+  @media (max-width:980px){ .grid-layout{ grid-template-columns:1fr; } }
+
+  .panel{ background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .panel-head{ display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--border-soft); }
+  .panel-head h2{ font-size:13px; margin:0; letter-spacing:0.04em; text-transform:uppercase; color:var(--text-dim); font-weight:700; }
+  .panel-head .count{ font-family:var(--font-mono); font-size:12px; color:var(--text-faint); }
+  .panel-body{ padding:16px 18px; }
+
+  /* ================= ZONE MAP ================= */
+  .zone-grid{
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(210px,1fr)); gap:12px;
+  }
+  .zone-card{
+    position:relative; border:1px solid var(--border); border-radius:9px; padding:14px;
+    background:
+      linear-gradient(var(--border-soft) 1px, transparent 1px) 0 0/14px 14px,
+      linear-gradient(90deg, var(--border-soft) 1px, transparent 1px) 0 0/14px 14px,
+      var(--panel-2);
+    transition:transform .15s ease;
+  }
+  .zone-card:hover{ transform:translateY(-1px); }
+  .zone-card .zc-top{ display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
+  .zone-icon{ width:20px; height:20px; flex:none; }
+  .state-pill{
+    display:inline-flex; align-items:center; gap:5px; font-family:var(--font-mono); font-size:10px;
+    font-weight:700; letter-spacing:0.06em; text-transform:uppercase; padding:4px 8px; border-radius:5px;
+  }
+  .state-pill.SAFE{ background:var(--safe-dim); color:var(--safe); }
+  .state-pill.WARNING{ background:var(--warning-dim); color:var(--warning); }
+  .state-pill.CRITICAL{ background:var(--critical-dim); color:var(--critical); }
+  .state-pill.OFFLINE{ background:var(--offline-dim); color:var(--offline); }
+  .zone-card.CRITICAL{ border-color:rgba(244,70,47,0.55); animation:cardAlert 1.3s infinite; }
+  @keyframes cardAlert{ 0%,100%{ box-shadow:0 0 0 rgba(244,70,47,0);} 50%{ box-shadow:0 0 0 3px rgba(244,70,47,0.18);} }
+  .zc-name{ font-weight:700; font-size:14.5px; margin-top:10px; letter-spacing:-0.005em; }
+  .zc-sub{ font-size:11px; color:var(--text-faint); margin-top:2px; }
+  .zc-meter{ margin-top:12px; }
+  .zc-meter-track{ height:6px; border-radius:4px; background:var(--border); overflow:hidden; }
+  .zc-meter-fill{ height:100%; border-radius:4px; transition:width .4s ease; }
+  .zc-meter-fill.SAFE{ background:var(--safe); }
+  .zc-meter-fill.WARNING{ background:var(--warning); }
+  .zc-meter-fill.CRITICAL{ background:var(--critical); }
+  .zc-meter-fill.OFFLINE{ background:var(--offline); }
+  .zc-meter-row{ display:flex; justify-content:space-between; align-items:baseline; margin-top:6px; }
+  .zc-score{ font-family:var(--font-mono); font-size:13px; font-weight:700; }
+  .zc-updated{ font-size:10px; color:var(--text-faint); font-family:var(--font-mono); }
+  .zone-empty-state{ color:var(--text-faint); font-size:13px; padding:20px; text-align:center; }
+
+  /* ================= PRIORITY QUEUE ================= */
+  .pq-row{
+    display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--border-soft);
+  }
+  .pq-row:last-child{ border-bottom:none; }
+  .pq-rank{
+    width:26px; height:26px; border-radius:50%; background:var(--border); display:flex; align-items:center;
+    justify-content:center; font-family:var(--font-mono); font-size:12px; font-weight:700; flex:none; color:var(--text-dim);
+  }
+  .pq-rank.r1{ background:var(--critical-dim); color:var(--critical); }
+  .pq-main{ flex:1; min-width:0; }
+  .pq-zone{ font-size:13.5px; font-weight:700; }
+  .pq-reason{ font-size:11px; color:var(--text-faint); font-family:var(--font-mono); margin-top:1px; }
+  .pq-ack{
+    flex:none; background:transparent; border:1px solid var(--border); color:var(--text-dim);
+    font-size:11px; padding:6px 10px; border-radius:6px;
+  }
+  .pq-ack:hover{ border-color:var(--accent); color:var(--accent); }
+  .pq-ack:disabled{ opacity:0.45; cursor:default; }
+  .pq-empty{ color:var(--text-faint); font-size:13px; padding:8px 0; }
+
+  /* ================= ADMIN OVERRIDE ================= */
+  .override-row{ display:flex; gap:8px; align-items:center; padding:9px 0; border-bottom:1px solid var(--border-soft); }
+  .override-row:last-child{ border-bottom:none; }
+  .override-row .oz{ flex:1; font-size:12.5px; }
+  .override-row select{
+    background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:6px;
+    padding:5px 7px; font-size:11.5px; font-family:var(--font-mono);
+  }
+  .override-row button{
+    background:var(--accent-dim); color:var(--accent); border:1px solid transparent; border-radius:6px;
+    padding:5px 10px; font-size:11px; font-weight:600;
+  }
+  .admin-note{ font-size:11px; color:var(--text-faint); line-height:1.5; margin-top:10px; }
+
+  /* ================= INCIDENT TIMELINE ================= */
+  .timeline-controls{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
+  .timeline-controls input, .timeline-controls select{
+    background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:7px;
+    padding:8px 10px; font-size:12.5px;
+  }
+  .timeline-controls input[type=text]{ min-width:180px; flex:1; }
+  table.incidents{ width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.incidents th{
+    text-align:left; color:var(--text-faint); font-weight:600; font-size:10.5px; text-transform:uppercase;
+    letter-spacing:0.05em; padding:8px 10px; border-bottom:1px solid var(--border);
+  }
+  table.incidents td{ padding:10px; border-bottom:1px solid var(--border-soft); vertical-align:middle; }
+  table.incidents tr:hover td{ background:rgba(255,255,255,0.015); }
+  .badge-state{ font-family:var(--font-mono); font-size:10px; padding:3px 7px; border-radius:4px; font-weight:700; }
+  .badge-state.WARNING{ background:var(--warning-dim); color:var(--warning); }
+  .badge-state.CRITICAL{ background:var(--critical-dim); color:var(--critical); }
+  .badge-status{ font-size:10.5px; color:var(--text-dim); font-family:var(--font-mono); }
+  .mono-cell{ font-family:var(--font-mono); color:var(--text-dim); }
+  .incidents-empty{ text-align:center; color:var(--text-faint); padding:26px; font-size:13px; }
+
+  /* ================= ALERT TOASTS ================= */
+  #toastStack{
+    position:fixed; top:72px; right:20px; width:320px; z-index:100; display:flex; flex-direction:column; gap:10px;
+  }
+  .toast{
+    background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--critical);
+    border-radius:8px; padding:12px 14px; box-shadow:0 8px 24px rgba(0,0,0,0.4);
+    animation:toastIn .25s ease;
+  }
+  @keyframes toastIn{ from{ opacity:0; transform:translateX(14px);} to{ opacity:1; transform:translateX(0);} }
+  .toast.WARNING{ border-left-color:var(--warning); }
+  .toast.acked{ opacity:0.55; }
+  .toast-top{ display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .toast-title{ font-size:13px; font-weight:700; }
+  .toast-time{ font-size:10px; color:var(--text-faint); font-family:var(--font-mono); flex:none; }
+  .toast-body{ font-size:11.5px; color:var(--text-dim); margin-top:4px; }
+  .toast-actions{ margin-top:9px; display:flex; gap:8px; }
+  .toast-actions button{
+    font-size:11px; padding:5px 10px; border-radius:6px; border:1px solid var(--border); background:transparent; color:var(--text-dim);
+  }
+  .toast-actions button.primary{ background:var(--accent-dim); color:var(--accent); border-color:transparent; }
+  .toast-actions button:disabled{ opacity:0.4; }
+
+  .visually-hidden{
+    position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap;
+  }
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN ================= -->
+<div id="loginScreen">
+  <div class="login-card">
+    <div class="login-mark"><span class="dot"></span><span>SCS-RG</span></div>
+    <h1>Campus Safety &amp; Response Grid</h1>
+    <p class="sub">Connect to the campus backend to view live zone status, priority alerts, and incident history.</p>
+
+    <div class="field">
+      <label for="backendUrl">Backend URL</label>
+      <input id="backendUrl" type="text" placeholder="http://localhost:8000 or your ngrok URL" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="authToken">Auth token (X-Auth-Token)</label>
+      <input id="authToken" type="text" placeholder="paste the token printed by seed.py" autocomplete="off" />
+    </div>
+    <button class="btn-primary" id="connectBtn">Connect to dashboard</button>
+    <div class="login-error" id="loginError"></div>
+
+    <div class="login-hint">
+      Tokens come from running <code>python seed.py</code> on the backend — it prints one token for
+      <code>admin1</code> (role: admin) and one for <code>staff1</code> (role: security_staff).
+      Nothing is stored after you close this tab.
+    </div>
+  </div>
+</div>
+
+<!-- ================= APP ================= -->
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" fill="none">
+        <rect x="2" y="2" width="8" height="8" rx="1.5" stroke="#3AA0FF" stroke-width="1.6"/>
+        <rect x="14" y="2" width="8" height="8" rx="1.5" stroke="#3AA0FF" stroke-width="1.6" opacity="0.55"/>
+        <rect x="2" y="14" width="8" height="8" rx="1.5" stroke="#3AA0FF" stroke-width="1.6" opacity="0.55"/>
+        <rect x="14" y="14" width="8" height="8" rx="1.5" stroke="#3AA0FF" stroke-width="1.6"/>
+      </svg>
+      <div class="brand-text">
+        <div class="name">SCS-RG</div>
+        <div class="tag">Campus Safety &amp; Response Grid</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <div class="conn-status"><span class="conn-dot" id="connDot"></span><span id="connLabel">connecting…</span></div>
+      <div class="userline"><b id="userName">—</b></div>
+      <span class="role-badge" id="roleBadge">—</span>
+      <button class="btn-ghost" id="disconnectBtn">Disconnect</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="urgent-banner state-safe" id="urgentBanner">
+      <div class="stripe"></div>
+      <svg class="urgent-icon" id="urgentIcon" viewBox="0 0 24 24" fill="none"></svg>
+      <div class="urgent-body">
+        <div class="urgent-eyebrow">Most urgent right now</div>
+        <div class="urgent-title" id="urgentTitle">All zones nominal</div>
+        <div class="urgent-reason" id="urgentReason">No active warnings or critical alerts across the grid.</div>
+      </div>
+      <div class="urgent-score" id="urgentScoreWrap" style="display:none;">
+        <div class="num" id="urgentScore">0</div>
+        <div class="lbl">risk score</div>
+      </div>
+    </div>
+
+    <div class="grid-layout">
+      <!-- LEFT: ZONE MAP -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Live zone map</h2>
+          <span class="count" id="zoneCount">0 zones</span>
+        </div>
+        <div class="panel-body">
+          <div class="zone-grid" id="zoneGrid">
+            <div class="zone-empty-state">Waiting for zone data…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: PRIORITY QUEUE + ADMIN -->
+      <div style="display:flex; flex-direction:column; gap:20px;">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Priority queue</h2>
+            <span class="count" id="pqCount">0 critical</span>
+          </div>
+          <div class="panel-body" id="pqBody">
+            <div class="pq-empty">No zones are currently CRITICAL.</div>
+          </div>
+        </div>
+
+        <div class="panel" id="adminPanel" style="display:none;">
+          <div class="panel-head"><h2>Manual override</h2></div>
+          <div class="panel-body">
+            <div id="overrideRows"></div>
+            <div class="admin-note">
+              Sets a zone's state directly on the backend. The backend independently enforces the admin
+              role on this endpoint — a security_staff token gets HTTP 403 even calling it directly, not
+              just when this panel is hidden.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- INCIDENT TIMELINE -->
+    <div class="panel" style="margin-top:20px;">
+      <div class="panel-head">
+        <h2>Incident timeline</h2>
+        <span class="count" id="incCount">0 incidents</span>
+      </div>
+      <div class="panel-body">
+        <div class="timeline-controls">
+          <input type="text" id="incSearch" placeholder="Search zone, hazard type, or status…" />
+          <input type="datetime-local" id="incStart" title="Start date" />
+          <input type="datetime-local" id="incEnd" title="End date" />
+          <select id="incStatusFilter">
+            <option value="">All statuses</option>
+            <option value="OPEN">Open</option>
+            <option value="ACKNOWLEDGED">Acknowledged</option>
+            <option value="RESOLVED">Resolved</option>
+          </select>
+          <button class="btn-ghost" id="incRefreshBtn">Apply filters</button>
+        </div>
+        <table class="incidents">
+          <thead>
+            <tr>
+              <th>Zone</th><th>Hazard</th><th>State</th><th>Status</th>
+              <th>Started</th><th>Duration</th><th>Acknowledged by</th><th>Resolved</th>
+            </tr>
+          </thead>
+          <tbody id="incTableBody"></tbody>
+        </table>
+        <div class="incidents-empty" id="incEmpty" style="display:none;">No incidents match these filters.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toastStack" aria-live="polite"></div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ===================== ICONS (accessibility: never rely on color alone) =====================
+  const ICONS = {
+    SAFE: '<path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/>',
+    WARNING: '<path d="M12 4l9 16H3L12 4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17.2" r="0.9" fill="currentColor"/>',
+    CRITICAL: '<path d="M12 2l3 3h4l3 3v4l3 3-3 3v4l-3 3h-4l-3 3-3-3H5l-3-3v-4l-3-3 3-3V8l3-3h4l3-3z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" transform="scale(0.78) translate(3,3)"/><path d="M12 8v5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="16" r="1" fill="currentColor"/>',
+    OFFLINE: '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M8 8l8 8M16 8l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>'
+  };
+  function iconSvg(state, size){
+    const s = size || 18;
+    return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" style="color:var(--${state.toLowerCase()==='offline'?'offline':state.toLowerCase()})">${ICONS[state] || ICONS.OFFLINE}</svg>`;
+  }
+  const STATE_LABEL = { SAFE:"Safe", WARNING:"Warning", CRITICAL:"Critical", OFFLINE:"Offline" };
+  const ZONE_HAZARD_HINT = {
+    iot_lab: "Fire · Gas · Occupancy",
+    robotics_lab: "Fire · Gas · Occupancy",
+    server_room: "Fire · Flood",
+    data_science_lab: "Fire · Occupancy",
+    software_lab: "Occupancy only"
+  };
+
+  // ===================== STATE =====================
+  let BACKEND_URL = "";
+  let AUTH_TOKEN = "";
+  let CURRENT_USER = null;
+  let ws = null;
+  let wsRetryTimer = null;
+
+  const zoneMeta = {};        // zone_id -> { name }
+  const zoneState = {};       // zone_id -> { state, risk_score, lastUpdated }
+  let priorityQueue = [];     // from /api/zones/priority-queue
+  let incidents = [];         // from /api/incidents
+  const activeToasts = {};    // incident_id -> toast element
+  const lastKnownIncidentIdByZone = {}; // zone_id -> incident_id (best-effort, for ack from priority queue)
+
+  // ===================== HELPERS =====================
+  function $(id){ return document.getElementById(id); }
+  function authHeaders(extra){
+    return Object.assign({ "X-Auth-Token": AUTH_TOKEN }, extra || {});
+  }
+  async function api(path, opts){
+    opts = opts || {};
+    const res = await fetch(BACKEND_URL + path, {
+      method: opts.method || "GET",
+      headers: Object.assign(authHeaders(opts.json ? {"Content-Type":"application/json"} : {}), opts.headers || {}),
+      body: opts.json ? JSON.stringify(opts.json) : undefined
+    });
+    if(!res.ok){
+      const text = await res.text().catch(()=> "");
+      throw new Error(`${res.status} ${res.statusText} ${text}`);
+    }
+    return res.json();
+  }
+  function fmtTime(iso){
+    if(!iso) return "—";
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  }
+  function fmtDuration(startIso, endIso){
+    const start = new Date(startIso).getTime();
+    const end = endIso ? new Date(endIso).getTime() : Date.now();
+    let s = Math.max(0, Math.floor((end-start)/1000));
+    const h = Math.floor(s/3600); s -= h*3600;
+    const m = Math.floor(s/60); s -= m*60;
+    return (h?`${h}h `:"") + (m?`${m}m `:"") + `${s}s`;
+  }
+  function beep(freq){
+    try{
+      const ctx = new (window.AudioContext||window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq || 880;
+      gain.gain.setValueAtTime(0.06, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(); osc.stop(ctx.currentTime + 0.35);
+    }catch(e){ /* audio not available -- toast still shows visually, so this is non-essential */ }
+  }
+
+  // ===================== LOGIN =====================
+  $("connectBtn").addEventListener("click", connect);
+  [$("backendUrl"), $("authToken")].forEach(el=>{
+    el.addEventListener("keydown", e=>{ if(e.key === "Enter") connect(); });
+  });
+
+  async function connect(){
+    const url = $("backendUrl").value.trim().replace(/\/+$/,"");
+    const token = $("authToken").value.trim();
+    const errEl = $("loginError");
+    errEl.style.display = "none";
+    if(!url || !token){
+      errEl.textContent = "Enter both a backend URL and an auth token.";
+      errEl.style.display = "block";
+      return;
+    }
+    BACKEND_URL = url;
+    AUTH_TOKEN = token;
+    $("connectBtn").disabled = true;
+    $("connectBtn").textContent = "Connecting…";
+
+    try{
+      const me = await api("/api/me");
+      CURRENT_USER = me;
+      $("userName").textContent = me.username;
+      $("roleBadge").textContent = me.role;
+      $("roleBadge").className = "role-badge " + me.role;
+      $("adminPanel").style.display = (me.role === "admin") ? "block" : "none";
+
+      $("loginScreen").style.display = "none";
+      $("app").style.display = "block";
+
+      await refreshZones();
+      await refreshPriorityQueue();
+      await refreshIncidents();
+      buildOverridePanel();
+      connectWebSocket();
+      setInterval(pollFallback, 5000); // fallback in case a websocket message is missed
+    }catch(e){
+      errEl.textContent = "Couldn't connect — check the URL and token. (" + e.message + ")";
+      errEl.style.display = "block";
+    }finally{
+      $("connectBtn").disabled = false;
+      $("connectBtn").textContent = "Connect to dashboard";
+    }
+  }
+
+  $("disconnectBtn").addEventListener("click", ()=>{
+    if(ws) ws.close();
+    clearTimeout(wsRetryTimer);
+    location.reload();
+  });
+
+  // ===================== WEBSOCKET =====================
+  function connectWebSocket(){
+    const wsUrl = BACKEND_URL.replace(/^http/, "ws") + "/ws/dashboard";
+    setConnStatus("connecting");
+    try{
+      ws = new WebSocket(wsUrl);
+    }catch(e){
+      setConnStatus("bad");
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = ()=>{ setConnStatus("good"); };
+    ws.onmessage = (evt)=>{
+      let msg;
+      try{ msg = JSON.parse(evt.data); }catch(e){ return; }
+      if(msg.type === "zone_update"){
+        handleZoneUpdate(msg);
+      }
+    };
+    ws.onclose = ()=>{
+      setConnStatus("bad");
+      scheduleReconnect();
+    };
+    ws.onerror = ()=>{ setConnStatus("bad"); };
+  }
+  function scheduleReconnect(){
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = setTimeout(async ()=>{
+      connectWebSocket();
+      // catch up to current state rather than showing stale data (Test Case 23d)
+      await refreshZones();
+      await refreshPriorityQueue();
+      await refreshIncidents();
+    }, 3000);
+  }
+  function setConnStatus(kind){
+    const dot = $("connDot"), label = $("connLabel");
+    dot.className = "conn-dot " + (kind === "good" ? "" : kind === "connecting" ? "warn" : "bad");
+    label.textContent = kind === "good" ? "live" : kind === "connecting" ? "connecting…" : "reconnecting…";
+  }
+  async function pollFallback(){
+    // Cheap safety net alongside the websocket -- keeps the dashboard correct
+    // even if a single push was dropped.
+    try{ await refreshZones(); await refreshPriorityQueue(); }catch(e){ /* handled by conn status already */ }
+  }
+
+  // ===================== ZONE UPDATES =====================
+  function handleZoneUpdate(msg){
+    const prev = zoneState[msg.zone_id];
+    const prevState = prev ? prev.state : "SAFE";
+    zoneState[msg.zone_id] = {
+      state: msg.state,
+      risk_score: msg.risk_score,
+      lastUpdated: msg.timestamp || new Date().toISOString(),
+      hazard_type: msg.hazard_type
+    };
+    renderZoneGrid();
+    renderUrgentBanner();
+
+    // New escalation into WARNING/CRITICAL -> surface a toast (Test Case 15a/15b)
+    if((msg.state === "WARNING" || msg.state === "CRITICAL") && msg.state !== prevState){
+      pushAlertToast(msg);
+      if(msg.state === "CRITICAL") beep(880); else beep(520);
+    }
+    // Recovered to SAFE -> quietly resolve any toast for that zone
+    if(msg.state === "SAFE"){
+      Object.values(activeToasts).forEach(t=>{
+        if(t.dataset.zoneId === msg.zone_id) t.remove();
+      });
+    }
+
+    refreshPriorityQueue();
+    refreshIncidents();
+  }
+
+  async function refreshZones(){
+    const data = await api("/api/zones/status");
+    data.zones.forEach(z=>{
+      zoneMeta[z.zone_id] = { name: z.name };
+      const existing = zoneState[z.zone_id];
+      zoneState[z.zone_id] = {
+        state: z.state,
+        risk_score: z.risk_score,
+        lastUpdated: existing ? existing.lastUpdated : new Date().toISOString()
+      };
+    });
+    renderZoneGrid();
+    renderUrgentBanner();
+  }
+
+  function renderZoneGrid(){
+    const ids = Object.keys(zoneMeta);
+    $("zoneCount").textContent = `${ids.length} zone${ids.length===1?"":"s"}`;
+    if(ids.length === 0){
+      $("zoneGrid").innerHTML = '<div class="zone-empty-state">No zones registered yet.</div>';
+      return;
+    }
+    $("zoneGrid").innerHTML = ids.map(id=>{
+      const meta = zoneMeta[id];
+      const st = zoneState[id] || { state:"SAFE", risk_score:0, lastUpdated:null };
+      const pct = Math.max(0, Math.min(100, st.risk_score || 0));
+      return `
+        <div class="zone-card ${st.state}">
+          <div class="zc-top">
+            ${iconSvg(st.state, 20)}
+            <span class="state-pill ${st.state}">${STATE_LABEL[st.state]}</span>
+          </div>
+          <div class="zc-name">${meta.name}</div>
+          <div class="zc-sub">${ZONE_HAZARD_HINT[id] || "Multi-hazard zone"} · <span class="mono-cell" style="font-size:10px;">${id}</span></div>
+          <div class="zc-meter">
+            <div class="zc-meter-track"><div class="zc-meter-fill ${st.state}" style="width:${pct}%;"></div></div>
+            <div class="zc-meter-row">
+              <span class="zc-score">${(st.risk_score ?? 0).toFixed ? st.risk_score.toFixed(1) : st.risk_score}</span>
+              <span class="zc-updated">${st.lastUpdated ? fmtTime(st.lastUpdated) : "—"}</span>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  function renderUrgentBanner(){
+    const banner = $("urgentBanner");
+    const ids = Object.keys(zoneState);
+    let top = null;
+    if(priorityQueue.length > 0){
+      top = { id: priorityQueue[0].zone_id, state:"CRITICAL", reason: priorityQueue[0].reason, score: priorityQueue[0].risk_score };
+    } else {
+      // fall back to the highest-risk WARNING zone, if any
+      let best = null;
+      ids.forEach(id=>{
+        const s = zoneState[id];
+        if(s.state === "WARNING" && (!best || s.risk_score > best.score)){
+          best = { id, state:"WARNING", score: s.risk_score };
+        }
+      });
+      top = best;
+    }
+
+    if(!top){
+      banner.className = "urgent-banner state-safe";
+      $("urgentIcon").innerHTML = ICONS.SAFE;
+      $("urgentIcon").style.color = "var(--safe)";
+      $("urgentTitle").textContent = "All zones nominal";
+      $("urgentReason").textContent = "No active warnings or critical alerts across the grid.";
+      $("urgentScoreWrap").style.display = "none";
+      return;
+    }
+
+    const name = (zoneMeta[top.id] && zoneMeta[top.id].name) || top.id;
+    banner.className = "urgent-banner state-" + top.state.toLowerCase();
+    $("urgentIcon").innerHTML = ICONS[top.state];
+    $("urgentIcon").style.color = "var(--" + top.state.toLowerCase() + ")";
+    $("urgentTitle").innerHTML = `<span class="zonename">${name}</span> — ${STATE_LABEL[top.state]}`;
+    $("urgentReason").textContent = top.reason || `Risk score ${top.score} on the ${top.state.toLowerCase()} threshold.`;
+    $("urgentScoreWrap").style.display = "block";
+    $("urgentScore").textContent = (top.score ?? 0);
+  }
+
+  // ===================== PRIORITY QUEUE =====================
+  async function refreshPriorityQueue(){
+    try{
+      const data = await api("/api/zones/priority-queue");
+      priorityQueue = data.priority_queue || [];
+      priorityQueue.forEach(z=>{ if(z.incident_id) lastKnownIncidentIdByZone[z.zone_id] = z.incident_id; });
+      renderPriorityQueue();
+      renderUrgentBanner();
+    }catch(e){ /* surfaced via connection status already */ }
+  }
+  function renderPriorityQueue(){
+    $("pqCount").textContent = `${priorityQueue.length} critical`;
+    if(priorityQueue.length === 0){
+      $("pqBody").innerHTML = '<div class="pq-empty">No zones are currently CRITICAL.</div>';
+      return;
+    }
+    $("pqBody").innerHTML = priorityQueue.map((z,i)=>{
+      const name = (zoneMeta[z.zone_id] && zoneMeta[z.zone_id].name) || z.zone_id;
+      const canAck = z.incident_id && z.incident_status === "OPEN";
+      return `
+        <div class="pq-row">
+          <div class="pq-rank ${i===0?'r1':''}">${i+1}</div>
+          <div class="pq-main">
+            <div class="pq-zone">${name}</div>
+            <div class="pq-reason">${z.reason}</div>
+          </div>
+          <button class="pq-ack" data-incident="${z.incident_id||''}" ${canAck? "":"disabled"}>
+            ${z.incident_status === "ACKNOWLEDGED" ? "Acknowledged" : canAck ? "Acknowledge" : "—"}
+          </button>
+        </div>`;
+    }).join("");
+    $("pqBody").querySelectorAll(".pq-ack[data-incident]").forEach(btn=>{
+      btn.addEventListener("click", ()=> acknowledge(btn.dataset.incident, btn));
+    });
+  }
+
+  async function acknowledge(incidentId, btnEl){
+    if(!incidentId) return;
+    if(btnEl){ btnEl.disabled = true; btnEl.textContent = "Acknowledging…"; }
+    try{
+      await api(`/api/incidents/${incidentId}/ack`, { method:"POST", json:{ user_id: CURRENT_USER.id } });
+      const toast = activeToasts[incidentId];
+      if(toast){
+        toast.classList.add("acked");
+        toast.querySelector(".toast-actions").innerHTML = `<span style="font-size:11px;color:var(--text-faint);">Acknowledged by ${CURRENT_USER.username}</span>`;
+      }
+      await refreshPriorityQueue();
+      await refreshIncidents();
+    }catch(e){
+      if(btnEl) btnEl.textContent = "Failed — retry";
+    }finally{
+      if(btnEl) btnEl.disabled = false;
+    }
+  }
+
+  // ===================== ALERT TOASTS (Test Case 15) =====================
+  function pushAlertToast(msg){
+    const name = (zoneMeta[msg.zone_id] && zoneMeta[msg.zone_id].name) || msg.zone_id;
+    const incidentId = lastKnownIncidentIdByZone[msg.zone_id]; // best-effort; refreshIncidents() will backfill if needed
+    const el = document.createElement("div");
+    el.className = "toast " + msg.state;
+    el.dataset.zoneId = msg.zone_id;
+    el.innerHTML = `
+      <div class="toast-top">
+        <div class="toast-title">${name} — ${STATE_LABEL[msg.state]}</div>
+        <div class="toast-time">${fmtTime(msg.timestamp)}</div>
+      </div>
+      <div class="toast-body">Hazard: ${msg.hazard_type || "—"} · Risk score ${msg.risk_score}</div>
+      <div class="toast-actions">
+        <button class="primary" data-act="ack">Acknowledge</button>
+        <button data-act="dismiss">Dismiss</button>
+      </div>`;
+    $("toastStack").prepend(el);
+
+    el.querySelector('[data-act="dismiss"]').addEventListener("click", ()=> el.remove());
+    el.querySelector('[data-act="ack"]').addEventListener("click", async ()=>{
+      // find the freshest incident id for this zone at click-time, in case it
+      // wasn't known yet when the toast was created
+      let id = incidentId;
+      if(!id){
+        await refreshIncidents();
+        const match = incidents.find(i => i.zone === name && i.status !== "RESOLVED");
+        id = match ? match.id : null;
+      }
+      if(id){
+        activeToasts[id] = el;
+        acknowledge(id, null);
+      }
+    });
+
+    if(incidentId) activeToasts[incidentId] = el;
+
+    // auto-fade CRITICAL toasts never; WARNING toasts after 20s if not the newest
+    if(msg.state === "WARNING"){
+      setTimeout(()=>{ if(el.isConnected) el.style.opacity = "0.7"; }, 20000);
+    }
+  }
+
+  // ===================== INCIDENT TIMELINE (Test Case 14) =====================
+  $("incRefreshBtn").addEventListener("click", refreshIncidents);
+  $("incSearch").addEventListener("input", renderIncidentTable);
+  $("incStatusFilter").addEventListener("change", renderIncidentTable);
+
+  async function refreshIncidents(){
+    const start = $("incStart").value ? new Date($("incStart").value).toISOString() : null;
+    const end = $("incEnd").value ? new Date($("incEnd").value).toISOString() : null;
+    let path = "/api/incidents";
+    const params = [];
+    if(start) params.push("start_date=" + encodeURIComponent(start));
+    if(end) params.push("end_date=" + encodeURIComponent(end));
+    if(params.length) path += "?" + params.join("&");
+    try{
+      const data = await api(path);
+      incidents = data.incidents || [];
+      renderIncidentTable();
+    }catch(e){ /* connection status already reflects backend issues */ }
+  }
+
+  function renderIncidentTable(){
+    const q = $("incSearch").value.trim().toLowerCase();
+    const statusFilter = $("incStatusFilter").value;
+    const rows = incidents.filter(i=>{
+      if(statusFilter && i.status !== statusFilter) return false;
+      if(!q) return true;
+      return (i.zone||"").toLowerCase().includes(q)
+          || (i.hazard_type||"").toLowerCase().includes(q)
+          || (i.status||"").toLowerCase().includes(q)
+          || (i.state||"").toLowerCase().includes(q);
+    });
+    $("incCount").textContent = `${rows.length} incident${rows.length===1?"":"s"}`;
+    $("incEmpty").style.display = rows.length ? "none" : "block";
+    $("incTableBody").innerHTML = rows.map(i=>`
+      <tr>
+        <td>${i.zone}</td>
+        <td>${i.hazard_type || "—"}</td>
+        <td><span class="badge-state ${i.state}">${i.state}</span></td>
+        <td><span class="badge-status">${i.status}</span></td>
+        <td class="mono-cell">${fmtTime(i.created_at)}</td>
+        <td class="mono-cell">${fmtDuration(i.created_at, i.resolved_at)}</td>
+        <td class="mono-cell">${i.acknowledged_by ?? "—"}</td>
+        <td class="mono-cell">${i.resolved_at ? fmtTime(i.resolved_at) : "—"}</td>
+      </tr>`).join("");
+  }
+
+  // ===================== ADMIN OVERRIDE (Test Case 13) =====================
+  function buildOverridePanel(){
+    if(CURRENT_USER.role !== "admin") return;
+    const ids = Object.keys(zoneMeta);
+    $("overrideRows").innerHTML = ids.map(id=>`
+      <div class="override-row">
+        <div class="oz">${zoneMeta[id].name}</div>
+        <select data-zone="${id}">
+          <option value="SAFE">SAFE</option>
+          <option value="WARNING">WARNING</option>
+          <option value="CRITICAL">CRITICAL</option>
+        </select>
+        <button data-zone-apply="${id}">Apply</button>
+      </div>`).join("");
+    $("overrideRows").querySelectorAll("[data-zone-apply]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        const zoneId = btn.dataset.zoneApply;
+        const select = $("overrideRows").querySelector(`select[data-zone="${zoneId}"]`);
+        const newState = select.value;
+        btn.disabled = true; btn.textContent = "Applying…";
+        try{
+          await api(`/api/admin/override/${zoneId}?new_state=${newState}`, { method:"POST" });
+          await refreshZones();
+          await refreshPriorityQueue();
+        }catch(e){
+          btn.textContent = "Failed";
+        }finally{
+          setTimeout(()=>{ btn.disabled=false; btn.textContent="Apply"; }, 800);
+        }
+      });
+    });
+  }
+})();
+</script>
+</body>
+</html>
